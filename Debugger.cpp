@@ -1,5 +1,3 @@
-// Build: g++ -std=c++17 -Wall -Wextra -g -o dbg_part4 src/debugger_part4.cpp
-
 #include <bits/stdc++.h>
 #include <sys/ptrace.h>
 #include <sys/wait.h>
@@ -112,7 +110,7 @@ bool set_breakpoint(pid_t pid, ull addr)
     if (errno)
         return false;
 
-    breakpoints[addr] = Breakpoint{addr, original_byte, true};
+    breakpoints[addr] = BreakpointInfo{addr, original_byte, true};
 
     cout << "Set breakpoint at 0x"
          << hex << addr << dec << "\n";
@@ -128,7 +126,6 @@ bool remove_breakpoint(pid_t pid, ull addr)
     cerr << "No breakpoint at 0x" << hex << addr << dec << "\n";
     return false;
   }
-  Breakpoint bp = it->second;
 
   ull aligned = addr & ~(sizeof(unsigned long) - 1);
   unsigned long word = ptrace_read(pid, aligned);
@@ -211,7 +208,7 @@ void report_process_status(int status)
 }
 
 // ----- Breakpoint hit handler ---
-// Called when child stopped with SIGTRAP from executing INT3
+// Called when process stopped with SIGTRAP
 
 bool handle_breakpoint_hit(pid_t pid, struct user_regs_struct &regs)
 {
@@ -226,7 +223,7 @@ bool handle_breakpoint_hit(pid_t pid, struct user_regs_struct &regs)
     return false; // koi aur trap hamare breakpoint ke alawa
   }
 
-  Breakpoint bp = it->second;
+  BreakpointInfo bp = it->second;
   cout << "Hit breakpoint at 0x" << hex << bp_addr << dec << "\n";
 
   ull aligned = bp_addr & ~(sizeof(unsigned long) - 1);
@@ -277,7 +274,7 @@ bool handle_breakpoint_hit(pid_t pid, struct user_regs_struct &regs)
 // --- Execution Control ---
 void continue_exec(pid_t pid)
 {
-  if (ptrace(PTRACE_CONT, pid, 0, 0) == -1)
+  if (ptrace(PTRACE_CONT, pid, nullptr, nullptr) == -1)
   {
     perror("PTRACE_CONT");
     return;
@@ -299,7 +296,7 @@ void continue_exec(pid_t pid)
     if (sig == SIGTRAP)
     {
       struct user_regs_struct regs;
-      if (ptrace(PTRACE_GETREGS, pid, 0, &regs) == -1)
+      if (ptrace(PTRACE_GETREGS, pid, nullptr, &regs) == -1)
       {
         perror("PTRACE_GETREGS");
         return;
@@ -321,7 +318,7 @@ void continue_exec(pid_t pid)
 
 void do_step(pid_t pid)
 {
-  if (ptrace(PTRACE_SINGLESTEP, pid, 0, 0) == -1)
+  if (ptrace(PTRACE_SINGLESTEP, pid, nullptr, nullptr) == -1)
   {
     perror("PTRACE_SINGLESTEP");
     return;
@@ -340,8 +337,8 @@ void do_step(pid_t pid)
   }
 }
 
-// ----------------- status printing using non-blocking wait -----------------
-void print_status(pid_t pid)
+// --- status print  ---
+void display_status(pid_t pid)
 {
   int status;
   pid_t r = waitpid(pid, &status, WNOHANG | WUNTRACED | WCONTINUED);
@@ -366,21 +363,21 @@ void print_status(pid_t pid)
   }
 }
 
-// ----------------- main REPL and launch -----------------
+// --- Our Main Function ---
 int main(int argc, char **argv)
 {
   if (argc < 2)
   {
-    cerr << "Usage: dbg_part4 <program> [args...]\n";
+    cerr << "Usage: dbg <program> [args...]\n";
     return 1;
   }
 
-  // prepare child args
   vector<char *> child_args;
   for (int i = 1; i < argc; ++i)
     child_args.push_back(argv[i]);
   child_args.push_back(nullptr);
 
+  pid_t child_pid = -1;
   child_pid = fork();
   if (child_pid == -1)
   {
@@ -390,7 +387,6 @@ int main(int argc, char **argv)
 
   if (child_pid == 0)
   {
-    // Child (debuggee)
     if (ptrace(PTRACE_TRACEME, 0, nullptr, nullptr) == -1)
     {
       perror("PTRACE_TRACEME");
@@ -401,17 +397,17 @@ int main(int argc, char **argv)
     _exit(1);
   }
 
-  // Parent (debugger)
+  // Parent
   cout << "Debugger started. Child pid: " << child_pid << "\n";
   int status = wait_for_process(child_pid);
   if (status == -1)
     return 1;
   if (WIFEXITED(status))
   {
-    cout << "Child exited prematurely.\n";
+    cout << "Child premature exited.\n";
     return 0;
   }
-  cout << "Child stopped; ready. Type 'help' for commands.\n";
+  cout << "Child stopped. Type 'help' for commands.\n";
 
   string line;
   while (true)
@@ -443,7 +439,7 @@ int main(int argc, char **argv)
            << "  step | s        - single-step one instruction\n"
            << "  regs            - print registers\n"
            << "  status          - print process status\n"
-           << "  quit | q        - kill debuggee and exit\n";
+           << "  quit | q        - stop debugger and exit\n";
       continue;
     }
     else if (cmd == "break" || cmd == "b")
@@ -503,7 +499,7 @@ int main(int argc, char **argv)
     }
     else if (cmd == "status")
     {
-      print_status(child_pid);
+      display_status(child_pid);
     }
     else
     {
