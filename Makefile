@@ -1,16 +1,24 @@
 CXX = g++
+CC  = gcc
+
 CXXFLAGS = -std=c++17 -Wall -Wextra -g
-SRC = debugger_part4.cpp
-BIN = dbg_part4
+CFLAGS   = -g -no-pie
 
-all: $(BIN)
+SRC_CPP = debugger.cpp
+BIN_CPP = dbg
 
-$(BIN): $(SRC)
-	mkdir -p bin
-	$(CXX) $(CXXFLAGS) -o bin/$(BIN) $(SRC)
+SRC_C   = test.c
+BIN_C   = test
+
+all: $(BIN_CPP) $(BIN_C)
+
+$(BIN_CPP): $(SRC_CPP)
+	$(CXX) $(CXXFLAGS) -o $(BIN_CPP) $(SRC_CPP)
+
+$(BIN_C): $(SRC_C)
+	$(CC) $(CFLAGS) -o $(BIN_C) $(SRC_C)
 
 clean:
-	rm -rf bin
+	rm -rf $(BIN_CPP) $(BIN_C)
 
 .PHONY: all clean
-
