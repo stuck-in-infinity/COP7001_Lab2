@@ -12,34 +12,60 @@
 using namespace std;
 using ull = unsigned long long;
 
-struct Breakpoint
+struct BreakpointInfo
 {
   ull addr;
   unsigned char original_byte;
   bool enabled;
 };
 
-pid_t child_pid = -1;
-unordered_map<ull, Breakpoint> breakpoints;
+pid_t debug_pid = -1;
+unordered_map<ull, BreakpointInfo> breakpoints;
 
-// ----------------- utility: parse hex address -----------------
-bool parse_address(const string &s, ull &out)
+// --- Convert hex string to ull ---
+bool convert_to_hex(const string &hex, ull &value)
 {
-  string t = s;
-  if (t.size() >= 2 && t[0] == '0' && (t[1] == 'x' || t[1] == 'X'))
-    t = t.substr(2);
-  char *end = nullptr;
-  errno = 0;
-  unsigned long long val = strtoull(t.c_str(), &end, 16);
-  if (end == t.c_str() || *end != '\0' || errno != 0)
-    return false;
-  out = val;
+  value = 0;
+
+  for (char c : hex)
+  {
+    int digit;
+    if (c >= '0' && c <= '9')
+      digit = c - '0';
+    else if (c >= 'a' && c <= 'f')
+      digit = c - 'a' + 10;
+    else if (c >= 'A' && c <= 'F')
+      digit = c - 'A' + 10;
+    else
+      return false;
+
+    if (value > (ULLONG_MAX - digit) / 16)
+      return false;
+
+    value = value * 16 + digit;
+  }
+
   return true;
 }
 
-// ----------------- ptrace word read/write helpers -----------------
-// read a machine word (unsigned long)
-unsigned long ptrace_read_word(pid_t pid, ull addr)
+// ---- Check if it is valid Hex address ---
+bool parse_address(const string &str, ull &out)
+{
+  string s = str;
+  if (s.size() >= 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X'))
+  if (s.size() >= 2 && s[0] == '0' &&
+      (s[1] == 'x' || s[1] == 'X'))
+    s = s.substr(2);
+
+  if (s.empty())
+    return false;
+
+  return convert_to_hex(s, out);
+}
+
+// ---- ptrace word read/write helpers ----
+
+unsigned long ptrace_read(pid_t pid, ull addr)
 {
   errno = 0;
   unsigned long data = ptrace(PTRACE_PEEKDATA, pid, (void *)addr, nullptr);
@@ -50,7 +76,7 @@ unsigned long ptrace_read_word(pid_t pid, ull addr)
   return data;
 }
 
-void ptrace_write_word(pid_t pid, ull addr, unsigned long data)
+void ptrace_write(pid_t pid, ull addr, unsigned long data)
 {
   if (ptrace(PTRACE_POKEDATA, pid, (void *)addr, (void *)data) == -1)
   {
@@ -58,36 +84,41 @@ void ptrace_write_word(pid_t pid, ull addr, unsigned long data)
   }
 }
 
-// ----------------- breakpoint management -----------------
+// --- breakpoint manage ---
 bool set_breakpoint(pid_t pid, ull addr)
 {
-  if (breakpoints.count(addr))
-  {
-    cerr << "Breakpoint already exists at 0x" << hex << addr << dec << "\n";
-    return false;
-  }
+    if (breakpoints.count(addr))
+    {
+        cerr << "Breakpoint already exists at 0x"
+             << hex << addr << dec << "\n";
+        return false;
+    }
 
-  // Read the machine word that contains the breakpoint byte
-  ull aligned = addr & ~(sizeof(unsigned long) - 1);
-  unsigned long word = ptrace_read_word(pid, aligned);
-  if (errno)
-    return false;
+    ull aligned = addr & ~(sizeof(unsigned long) - 1);
+    unsigned long word = ptrace_read(pid, aligned);
+    if (errno)
+        return false;
 
-  size_t offset = addr - aligned;
-  unsigned char orig_byte = (word >> (8 * offset)) & 0xFF;
+    size_t offset = addr - aligned;
+    unsigned long shift = 8 * offset;
+    unsigned long mask  = 0xFFUL << shift;
 
-  // write new word with 0xCC at the target byte
-  unsigned long new_word = word & ~((unsigned long)0xFF << (8 * offset));
-  new_word |= ((unsigned long)0xCC << (8 * offset));
-  ptrace_write_word(pid, aligned, new_word);
-  if (errno)
-    return false;
+    unsigned char original_byte = (word & mask) >> shift;
 
-  Breakpoint bp{addr, orig_byte, true};
-  breakpoints[addr] = bp;
-  cout << "Set breakpoint at 0x" << hex << addr << dec << "\n";
-  return true;
+    unsigned long patched_word =
+        (word & ~mask) | (0xCCUL << shift);
+
+    ptrace_write(pid, aligned, patched_word);
+    if (errno)
+        return false;
+
+    breakpoints[addr] = Breakpoint{addr, original_byte, true};
+
+    cout << "Set breakpoint at 0x"
+         << hex << addr << dec << "\n";
+    return true;
 }
+
 
 bool remove_breakpoint(pid_t pid, ull addr)
 {
@@ -100,14 +131,13 @@ bool remove_breakpoint(pid_t pid, ull addr)
   Breakpoint bp = it->second;
 
   ull aligned = addr & ~(sizeof(unsigned long) - 1);
-  unsigned long word = ptrace_read_word(pid, aligned);
+  unsigned long word = ptrace_read(pid, aligned);
   if (errno)
     return false;
 
   size_t offset = addr - aligned;
-  unsigned long cleared = word & ~((unsigned long)0xFF << (8 * offset));
-  unsigned long restored = cleared | ((unsigned long)bp.original_byte << (8 * offset));
-  ptrace_write_word(pid, aligned, restored);
+  unsigned long restored = (word & ~((unsigned long)0xFF << (8 * offset))) | ((unsigned long)it->second.original_byte << (8 * offset));
+  ptrace_write(pid, aligned, restored);
   if (errno)
     return false;
 
@@ -116,7 +146,7 @@ bool remove_breakpoint(pid_t pid, ull addr)
   return true;
 }
 
-void list_breakpoints()
+void show_breakpoints()
 {
   if (breakpoints.empty())
   {
@@ -125,13 +155,12 @@ void list_breakpoints()
   }
   cout << "Breakpoints:\n";
   for (auto &p : breakpoints)
-  {
     cout << "  0x" << hex << p.first << dec << "\n";
-  }
+
 }
 
 // ----------------- register printing -----------------
-void print_regs(pid_t pid)
+void display_registers(pid_t pid)
 {
   struct user_regs_struct regs;
   if (ptrace(PTRACE_GETREGS, pid, nullptr, &regs) == -1)
@@ -150,7 +179,7 @@ void print_regs(pid_t pid)
 }
 
 // ----------------- wait helpers -----------------
-int wait_for_pid(pid_t pid)
+int wait_for_process(pid_t pid)
 {
   int status = 0;
   if (waitpid(pid, &status, 0) == -1)
@@ -161,7 +190,7 @@ int wait_for_pid(pid_t pid)
   return status;
 }
 
-void report_status(int status)
+void report_process_status(int status)
 {
   if (WIFEXITED(status))
   {
@@ -181,9 +210,9 @@ void report_status(int status)
   }
 }
 
-// ----------------- handle breakpoint hit properly -----------------
+// ----- Breakpoint hit handler ---
 // Called when child stopped with SIGTRAP from executing INT3
-// We assume regs.rip points to bp_addr + 1
+
 bool handle_breakpoint_hit(pid_t pid, struct user_regs_struct &regs)
 {
   ull rip = regs.rip;
@@ -194,26 +223,23 @@ bool handle_breakpoint_hit(pid_t pid, struct user_regs_struct &regs)
   auto it = breakpoints.find(bp_addr);
   if (it == breakpoints.end())
   {
-    // not our software breakpoint (could be other trap)
-    return false;
+    return false; // koi aur trap hamare breakpoint ke alawa
   }
 
   Breakpoint bp = it->second;
   cout << "Hit breakpoint at 0x" << hex << bp_addr << dec << "\n";
 
-  // Restore original byte
   ull aligned = bp_addr & ~(sizeof(unsigned long) - 1);
-  unsigned long word = ptrace_read_word(pid, aligned);
+  unsigned long word = ptrace_read(pid, aligned);
   if (errno)
     return false;
   size_t offset = bp_addr - aligned;
   unsigned long cleared = word & ~((unsigned long)0xFF << (8 * offset));
   unsigned long restored = cleared | ((unsigned long)bp.original_byte << (8 * offset));
-  ptrace_write_word(pid, aligned, restored);
+  ptrace_write(pid, aligned, restored);
   if (errno)
     return false;
 
-  // Move RIP back so instruction executes
   regs.rip = bp_addr;
   if (ptrace(PTRACE_SETREGS, pid, 0, &regs) == -1)
   {
@@ -221,36 +247,35 @@ bool handle_breakpoint_hit(pid_t pid, struct user_regs_struct &regs)
     return false;
   }
 
-  // Single-step the original instruction (now that it's restored)
   if (ptrace(PTRACE_SINGLESTEP, pid, 0, 0) == -1)
   {
     perror("PTRACE_SINGLESTEP");
     return false;
   }
-  int status = wait_for_pid(pid);
+  int status = wait_for_process(pid);
   if (status == -1)
     return false;
   if (WIFEXITED(status))
   {
-    report_status(status);
+    report_process_status(status);
     return false;
   }
 
-  // After single-step, re-insert the breakpoint (0xCC) so it remains next time
-  unsigned long word_after = ptrace_read_word(pid, aligned);
-  if (errno)
-    return false;
-  unsigned long new_word = (word_after & ~((unsigned long)0xFF << (8 * offset))) | ((unsigned long)0xCC << (8 * offset));
-  ptrace_write_word(pid, aligned, new_word);
+  unsigned long word_after = ptrace_read(pid, aligned);
   if (errno)
     return false;
 
-  cout << "Breakpoint at 0x" << hex << bp_addr << dec << " handled (single-stepped).\n";
+  unsigned long new_word = (word_after & ~((unsigned long)0xFF << (8 * offset))) | ((unsigned long)0xCC << (8 * offset));
+  ptrace_write(pid, aligned, new_word);
+  if (errno)
+    return false;
+
+  cout << "Breakpoint at 0x" << hex << bp_addr << dec << " handled\n";
   return true;
 }
 
-// ----------------- continue with detection of breakpoint hits -----------------
-void do_continue(pid_t pid)
+// --- Execution Control ---
+void continue_exec(pid_t pid)
 {
   if (ptrace(PTRACE_CONT, pid, 0, 0) == -1)
   {
@@ -258,13 +283,13 @@ void do_continue(pid_t pid)
     return;
   }
 
-  int status = wait_for_pid(pid);
+  int status = wait_for_process(pid);
   if (status == -1)
     return;
 
   if (WIFEXITED(status) || WIFSIGNALED(status))
   {
-    report_status(status);
+    report_process_status(status);
     return;
   }
 
@@ -273,7 +298,6 @@ void do_continue(pid_t pid)
     int sig = WSTOPSIG(status);
     if (sig == SIGTRAP)
     {
-      // get registers to check if this is a breakpoint hit
       struct user_regs_struct regs;
       if (ptrace(PTRACE_GETREGS, pid, 0, &regs) == -1)
       {
@@ -284,12 +308,7 @@ void do_continue(pid_t pid)
       // handle breakpoint if present
       if (!handle_breakpoint_hit(pid, regs))
       {
-        // Not a software breakpoint we set; just report
         cout << "Stopped with SIGTRAP at RIP=0x" << hex << regs.rip << dec << "\n";
-      }
-      else
-      {
-        // After handling, we are stopped (after single-step). Child is ready.
       }
     }
     else
@@ -299,7 +318,7 @@ void do_continue(pid_t pid)
   }
 }
 
-// ----------------- single step wrapper -----------------
+
 void do_step(pid_t pid)
 {
   if (ptrace(PTRACE_SINGLESTEP, pid, 0, 0) == -1)
@@ -307,12 +326,12 @@ void do_step(pid_t pid)
     perror("PTRACE_SINGLESTEP");
     return;
   }
-  int status = wait_for_pid(pid);
+  int status = wait_for_process(pid);
   if (status == -1)
     return;
   if (WIFEXITED(status) || WIFSIGNALED(status))
   {
-    report_status(status);
+    report_process_status(status);
     return;
   }
   if (WIFSTOPPED(status))
@@ -384,7 +403,7 @@ int main(int argc, char **argv)
 
   // Parent (debugger)
   cout << "Debugger started. Child pid: " << child_pid << "\n";
-  int status = wait_for_pid(child_pid);
+  int status = wait_for_process(child_pid);
   if (status == -1)
     return 1;
   if (WIFEXITED(status))
@@ -466,13 +485,13 @@ int main(int argc, char **argv)
       string sub;
       ss >> sub;
       if (sub == "breakpoints")
-        list_breakpoints();
+        show_breakpoints();
       else
         cout << "Unknown info command\n";
     }
     else if (cmd == "continue" || cmd == "c")
     {
-      do_continue(child_pid);
+      continue_exec(child_pid);
     }
     else if (cmd == "step" || cmd == "s")
     {
@@ -480,7 +499,7 @@ int main(int argc, char **argv)
     }
     else if (cmd == "regs")
     {
-      print_regs(child_pid);
+      display_registers(child_pid);
     }
     else if (cmd == "status")
     {
